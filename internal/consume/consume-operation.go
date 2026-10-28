@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/protobuf/reflect/protoreflect"
 
+	"github.com/deviceinsight/kafkactl/v5/internal/helpers/avro"
 	"github.com/deviceinsight/kafkactl/v5/internal/helpers/protobuf"
 
 	"github.com/deviceinsight/kafkactl/v5/internal/helpers"
@@ -47,7 +48,10 @@ type Flags struct {
 	ProtoMarshalOptions []string
 	KeyProtoType        string
 	ValueProtoType      string
+	AvroSchemaFile      string
+	AvroSchemaHeader    string
 	IsolationLevel      string
+	IgnoreErrors        bool
 
 	FilterKey    string
 	FilterValue  string
@@ -106,27 +110,10 @@ func (operation *Operation) Consume(topic string, flags Flags) error {
 		}
 	}
 
-	var deserializers MessageDeserializerChain
-	var protobufConfig internal.ProtobufConfig
-
-	if protobufConfig, err = addFlagsToProtobufConfig(clientContext.Protobuf, flags); err != nil {
-		return err
-	}
-
-	if schemaRegistryClient != nil {
-		avroDeserializer := AvroMessageDeserializer{topic: topic, registry: schemaRegistryClient, jsonCodec: clientContext.Avro.JSONCodec}
-		protobufDeserializer := RegistryProtobufMessageDeserializer{config: protobufConfig, registry: schemaRegistryClient}
-		jsonSchemaDeserializer := JSONSchemaMessageDeserializer{topic: topic, registry: schemaRegistryClient}
-		deserializers = append(deserializers, &avroDeserializer, &protobufDeserializer, &jsonSchemaDeserializer)
-	}
-
-	deserializer, err := CreateProtobufMessageDeserializer(protobufConfig, protoreflect.FullName(flags.KeyProtoType), protoreflect.FullName(flags.ValueProtoType))
+	deserializers, err := createDeserializerChain(topic, flags, clientContext, schemaRegistryClient)
 	if err != nil {
 		return err
 	}
-
-	deserializers = append(deserializers, deserializer)
-	deserializers = append(deserializers, &DefaultMessageDeserializer{})
 
 	if flags.Group != "" {
 		if flags.Exit {
@@ -195,6 +182,42 @@ func (operation *Operation) Consume(topic string, flags Flags) error {
 	return nil
 }
 
+func createDeserializerChain(topic string, flags Flags, clientContext internal.ClientContext,
+	schemaRegistryClient *internal.CachingSchemaRegistry,
+) (MessageDeserializerChain, error) {
+	var deserializers MessageDeserializerChain
+
+	protobufConfig, err := addFlagsToProtobufConfig(clientContext.Protobuf, flags)
+	if err != nil {
+		return nil, err
+	}
+
+	if flags.AvroSchemaFile != "" || flags.AvroSchemaHeader != "" {
+		source := avro.NewSchemaSource(clientContext.Avro.JSONCodec)
+
+		avroFileDeserializer, err := CreateAvroFileMessageDeserializer(flags.AvroSchemaFile, flags.AvroSchemaHeader, source)
+		if err != nil {
+			return nil, err
+		}
+		deserializers = append(deserializers, avroFileDeserializer)
+	}
+
+	if schemaRegistryClient != nil {
+		avroDeserializer := AvroMessageDeserializer{topic: topic, registry: schemaRegistryClient, jsonCodec: clientContext.Avro.JSONCodec}
+		protobufDeserializer := RegistryProtobufMessageDeserializer{config: protobufConfig, registry: schemaRegistryClient}
+		jsonSchemaDeserializer := JSONSchemaMessageDeserializer{topic: topic, registry: schemaRegistryClient}
+		deserializers = append(deserializers, &avroDeserializer, &protobufDeserializer, &jsonSchemaDeserializer)
+	}
+
+	protoDeserializer, err := CreateProtobufMessageDeserializer(protobufConfig,
+		protoreflect.FullName(flags.KeyProtoType), protoreflect.FullName(flags.ValueProtoType))
+	if err != nil {
+		return nil, err
+	}
+
+	return append(deserializers, protoDeserializer, &DefaultMessageDeserializer{}), nil
+}
+
 func addFlagsToProtobufConfig(protobufConfig internal.ProtobufConfig, flags Flags) (internal.ProtobufConfig, error) {
 
 	protobufConfig.ProtosetFiles = append(flags.ProtosetFiles, protobufConfig.ProtosetFiles...)
@@ -260,8 +283,8 @@ func deserializeMessages(ctx context.Context, flags Flags, messages <-chan *sara
 			}
 			lastIndex := len(sortedMessages) - 1
 			for i := range sortedMessages {
-				err := deserializers.Deserialize(sortedMessages[lastIndex-i], flags, filter)
-				if err != nil {
+				msg := sortedMessages[lastIndex-i]
+				if err := deserializers.Deserialize(msg, flags, filter); err != nil && !ignoreDeserializationError(flags, msg, err) {
 					return err
 				}
 			}
@@ -276,6 +299,10 @@ func deserializeMessages(ctx context.Context, flags Flags, messages <-chan *sara
 
 			for msg := range messages {
 				err = deserializers.Deserialize(msg, flags, filter)
+				if err != nil && ignoreDeserializationError(flags, msg, err) {
+					err = nil
+					continue
+				}
 				messageCount++
 				if err != nil {
 					close(stopConsumers)
@@ -297,6 +324,14 @@ func deserializeMessages(ctx context.Context, flags Flags, messages <-chan *sara
 	}
 
 	return errorGroup
+}
+
+func ignoreDeserializationError(flags Flags, msg *sarama.ConsumerMessage, err error) bool {
+	if !flags.IgnoreErrors || !isDeserializationError(err) {
+		return false
+	}
+	output.Warnf("skipping message on partition %d at offset %d: %v", msg.Partition, msg.Offset, err)
+	return true
 }
 
 func insertSorted(messages []*sarama.ConsumerMessage, message *sarama.ConsumerMessage) []*sarama.ConsumerMessage {

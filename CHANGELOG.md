@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- [#337](https://github.com/deviceinsight/kafkactl/issues/337) Support decoding/encoding Avro messages without a schema registry, via `--avro-schema-file` (`produce`/`consume`) and `--avro-schema-header` (`consume`, opt-in, e.g. `ce_dataschema` for CloudEvents-style per-message schema URIs), including CloudEvents in structured content mode with the JSON event format
+
+## 5.21.0 - 2026-10-09
+
+### Added
 - [#298](https://github.com/deviceinsight/kafkactl/issues/298) Support filtering ACL deletion by resource name
 - [#137](https://github.com/deviceinsight/kafkactl/issues/137) Spread replicas across racks when altering replication factor
+- [#197](https://github.com/deviceinsight/kafkactl/issues/197) `consume --ignore-errors` continues consuming and prints a warning when a message cannot be deserialized instead of aborting
+
+### Changed
+- Update to Go 1.27.1 and upgrade dependencies
 
 ### Fixed
 - [#345](https://github.com/deviceinsight/kafkactl/issues/345) Fix `unable to read tls.key` with `kubernetes.enabled`: the cert key is no longer read locally, so an encrypted key needs `tls.certKeyPassphrase` in config; the pod no longer uses the OS keyring
+- [#326](https://github.com/deviceinsight/kafkactl/issues/326) Load configured Protobuf marshal options, support their environment variable aliases, and preserve them in Kubernetes proxy mode.
 
 ## 5.20.0 - 2026-07-30
 

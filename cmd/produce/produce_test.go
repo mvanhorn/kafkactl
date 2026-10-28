@@ -3,9 +3,11 @@ package produce_test
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/dynamicpb"
 
+	"github.com/linkedin/goavro/v2"
 	"github.com/riferrei/srclient"
 
 	"github.com/deviceinsight/kafkactl/v5/internal"
@@ -93,6 +96,147 @@ func TestProduceAvroMessageWithHeadersIntegration(t *testing.T) {
 	}
 
 	testutil.AssertEquals(t, fmt.Sprintf("key1:value1,key\\:2:value\\:2#test-key#%s", value), kafkaCtl.GetStdOut())
+}
+
+func TestProduceConsumeAvroSchemaFileIntegration(t *testing.T) {
+	testutil.StartIntegrationTestWithContext(t, "no-schema-reg")
+
+	topicName := testutil.CreateTopic(t, "produce-avro-file-topic")
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	value := `{"name":"Peter Mueller","num":42}`
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value, "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	// field order in the decoded JSON isn't guaranteed by goavro's standard JSON codec, so
+	// check the key prefix and each field individually rather than the full string
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, "test-key#{", stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
+}
+
+func TestProduceConsumeAvroSchemaFromHeaderIntegration(t *testing.T) {
+	testutil.StartIntegrationTestWithContext(t, "no-schema-reg")
+
+	topicName := testutil.CreateTopic(t, "produce-avro-header-topic")
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	value := `{"name":"Peter Mueller","num":42}`
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value,
+		"--avro-schema-file", schemaFile, "-H", "ce_dataschema:"+(&url.URL{Scheme: "file", Path: filepath.ToSlash(schemaFile)}).String()); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	// no --avro-schema-file passed: resolved from the ce_dataschema header via --avro-schema-header
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys",
+		"--avro-schema-header", "ce_dataschema"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	// field order in the decoded JSON isn't guaranteed by goavro's standard JSON codec, so
+	// check the key prefix and each field individually rather than the full string
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, "test-key#{", stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
+}
+
+func TestConsumeAvroStructuredCloudEventIntegration(t *testing.T) {
+	testutil.StartIntegrationTestWithContext(t, "no-schema-reg")
+
+	topicName := testutil.CreateTopic(t, "consume-avro-structured-topic")
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	schemaURI := (&url.URL{Scheme: "file", Path: filepath.ToSlash(schemaFile)}).String()
+
+	schema, err := os.ReadFile(schemaFile)
+	if err != nil {
+		t.Fatalf("failed to read schema: %v", err)
+	}
+
+	codec, err := goavro.NewCodecForStandardJSONFull(string(schema))
+	if err != nil {
+		t.Fatalf("failed to create codec: %v", err)
+	}
+
+	native, _, err := codec.NativeFromTextual([]byte(`{"name":"Peter Mueller","num":42}`))
+	if err != nil {
+		t.Fatalf("failed to convert to native: %v", err)
+	}
+
+	avroData, err := codec.BinaryFromNative(nil, native)
+	if err != nil {
+		t.Fatalf("failed to convert to binary: %v", err)
+	}
+
+	event := fmt.Sprintf(`{"specversion":"1.0","id":"1","source":"/test","type":"test","datacontenttype":"application/avro",`+
+		`"dataschema":%q,"data_base64":%q}`, schemaURI, base64.StdEncoding.EncodeToString(avroData))
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--value", event,
+		"-H", "content-type:application/cloudevents+json; charset=UTF-8"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit",
+		"--avro-schema-header", "ce_dataschema"); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, fmt.Sprintf(`{"specversion":"1.0","id":"1","source":"/test","type":"test",`+
+		`"datacontenttype":"application/avro","dataschema":%q,"data":{`, schemaURI), stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
+}
+
+func TestProduceAvroSchemaFileTakesPrecedenceOverRegistryIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	// deliberately different from testdata/msg.avsc, so a registry-encoded message would not
+	// round-trip cleanly with it.
+	registrySchema := `{"type":"record","name":"Unrelated","fields":[{"name":"unrelated","type":"string"}]}`
+
+	schemaFile := filepath.Join(testutil.RootDir, "internal", "testutil", "testdata", "msg.avsc")
+	value := `{"name":"Peter Mueller","num":42}`
+
+	topicName := testutil.CreateTopicWithSchema(t, "produce-avro-file-precedence-topic", "", registrySchema, srclient.Avro)
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	if _, err := kafkaCtl.Execute("produce", topicName, "--key", "test-key", "--value", value, "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	testutil.AssertEquals(t, "message produced (partition=0\toffset=0)", kafkaCtl.GetStdOut())
+
+	// even though the topic has a registered (and incompatible) avro schema, --avro-schema-file
+	// must still take precedence and encode the value with the local schema, unframed.
+	if _, err := kafkaCtl.Execute("consume", topicName, "--from-beginning", "--exit", "--print-keys", "--avro-schema-file", schemaFile); err != nil {
+		t.Fatalf("failed to execute command: %v", err)
+	}
+
+	stdout := kafkaCtl.GetStdOut()
+	testutil.AssertContainSubstring(t, "test-key#{", stdout)
+	testutil.AssertContainSubstring(t, `"name":"Peter Mueller"`, stdout)
+	testutil.AssertContainSubstring(t, `"num":42`, stdout)
 }
 
 func TestProduceAvroMessageOmitDefaultValueIntegration(t *testing.T) {
@@ -996,6 +1140,36 @@ func TestProduceLongMessageFailsIntegration(t *testing.T) {
 	} else {
 		t.Fatalf("Expected producer to fail")
 	}
+}
+
+func TestProduceMessageCountExcludesFailedMessagesIntegration(t *testing.T) {
+	testutil.StartIntegrationTest(t)
+
+	topic := testutil.CreateTopic(t, "produce-topic-count")
+
+	file, err := os.CreateTemp(os.TempDir(), "too-large-message-")
+	if err != nil {
+		t.Fatalf("unable to generate test file: %v", err)
+	}
+	defer os.Remove(file.Name())
+
+	kafkaCtl := testutil.CreateKafkaCtlCommand()
+
+	// 2 MB message: passes the client-side limit configured below, but exceeds the
+	// broker's default message.max.bytes (1048588), so the broker rejects it.
+	data := bytes.Repeat([]byte("K"), 2*1024*1024)
+
+	if err := os.WriteFile(file.Name(), data, 0644); err != nil {
+		t.Fatalf("unable to write test file: %v", err)
+	}
+
+	if _, err := kafkaCtl.Execute("produce", topic, "--max-message-bytes", strconv.Itoa(3*1024*1024), "--file", file.Name()); err != nil {
+		testutil.AssertErrorContains(t, "Failed to produce message", err)
+	} else {
+		t.Fatalf("Expected producer to fail")
+	}
+
+	testutil.AssertEquals(t, "0 messages produced", kafkaCtl.GetStdOut())
 }
 
 func marshalJSON(message *dynamicpb.Message) ([]byte, error) {
